@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.*;
 
-import com.google.common.base.Predicates;
 import com.google.common.collect.MapDifference;
 import com.google.common.collect.Maps;
 import com.google.common.hash.Hasher;
@@ -34,7 +33,8 @@ class TargetHashingClientImpl implements TargetHashingClient {
     @Override
     public Map<String, String> hashAllBazelTargetsAndSourcefiles(Set<Path> seedFilepaths) throws Exception {
         Map<String, BazelSourceFileTarget> bazelSourcefileTargets = bazelClient.queryAllSourcefileTargets();
-        return hashAllTargets(createSeedForFilepaths(seedFilepaths), bazelSourcefileTargets);
+        List<BazelTarget> allTargets = bazelClient.queryAllTargets();
+        return hashAllTargets(createSeedForFilepaths(seedFilepaths), bazelSourcefileTargets, allTargets);
     }
 
     @Override
@@ -94,6 +94,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
         return createDigestForRule(targetRule, allRulesMap, ruleHashes, bazelSourcefileTargets, seedHash);
     }
 
+
     private byte[] createDigestForRule(
             BazelRule rule,
             Map<String, BazelRule> allRulesMap,
@@ -101,7 +102,21 @@ class TargetHashingClientImpl implements TargetHashingClient {
             Map<String, BazelSourceFileTarget> bazelSourcefileTargets,
             byte[] seedHash
     ) {
-        return ruleHashes.computeIfAbsent(rule.getName(), (String) -> {
+        if (!ruleHashes.containsKey(rule.getName())) {
+            //Precompute all the inputs first
+            for (String ruleInput : rule.getRuleInputList()) {
+                BazelRule inputRule = allRulesMap.get(ruleInput);
+                if (inputRule != null && inputRule.getName() != null && !inputRule.getName().equals(rule.getName())) {
+                    createDigestForRule(
+                            inputRule,
+                            allRulesMap,
+                            ruleHashes,
+                            bazelSourcefileTargets,
+                            seedHash
+                    );
+                }
+            }
+
             Hasher hasher = Hashing.sha256().newHasher();
             hasher.putBytes(rule.getDigest());
             if (seedHash != null) {
@@ -128,8 +143,12 @@ class TargetHashingClientImpl implements TargetHashingClient {
                     }
                 }
             }
-            return hasher.hash().asBytes().clone();
-        });
+            byte[] value = hasher.hash().asBytes().clone();
+            ruleHashes.put(rule.getName(), value);
+            return value;
+        } else {
+            return ruleHashes.get(rule.getName());
+        }
     }
 
     private byte[] createSeedForFilepaths(Set<Path> seedFilepaths) throws IOException {
@@ -174,22 +193,20 @@ class TargetHashingClientImpl implements TargetHashingClient {
         return null;
     }
 
-    private Map<String, String> hashAllTargets(byte[] seedHash, Map<String, BazelSourceFileTarget> bazelSourcefileTargets) throws IOException {
-        List<BazelTarget> allTargets = bazelClient.queryAllTargets();
+    private Map<String, String> hashAllTargets(byte[] seedHash, Map<String, BazelSourceFileTarget> bazelSourcefileTargets, List<BazelTarget> allTargets) {
         ConcurrentMap<String, byte[]> ruleHashes = new ConcurrentHashMap<>();
-        Map<String, BazelRule> allRulesMap = new HashMap<>();
+        Map<String, BazelRule> targetToRule = new HashMap<>();
+
         for (BazelTarget target : allTargets) {
             String targetName = getNameForTarget(target);
             if (targetName == null) {
                 continue;
             }
             if (target.hasRule()) {
-                allRulesMap.put(targetName, target.getRule());
+                targetToRule.put(targetName, target.getRule());
             }
-        }
-        for (BazelTarget target : allTargets) {
             if (target.hasGeneratedFile()) {
-                allRulesMap.put(getNameForTarget(target), allRulesMap.get(target.getGeneratingRuleName()));
+                targetToRule.put(getNameForTarget(target), targetToRule.get(target.getGeneratingRuleName()));
             }
         }
 
@@ -199,7 +216,7 @@ class TargetHashingClientImpl implements TargetHashingClient {
                     if (targetName != null) {
                         byte[] targetDigest = createDigestForTarget(
                                 target,
-                                allRulesMap,
+                                targetToRule,
                                 bazelSourcefileTargets,
                                 ruleHashes,
                                 seedHash
@@ -223,7 +240,12 @@ class TargetHashingClientImpl implements TargetHashingClient {
             this.value = value;
         }
 
-        public K getKey() { return key; }
-        public V getValue() { return value; }
+        public K getKey() {
+            return key;
+        }
+
+        public V getValue() {
+            return value;
+        }
     }
 }
